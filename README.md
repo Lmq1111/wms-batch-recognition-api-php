@@ -1,0 +1,477 @@
+# WMS Batch Recognition API PHP
+
+PHP 版 WMS 小程序批次号 AI 识别纯接口服务。它接收前端或小程序后端传来的图片，调用阿里云百炼 DashScope 视觉模型识别 `厂商批号`、`生产日期`、`失效日期` 三个可人工确认字段，并返回候选结果、审计字段和耗时字段。
+
+本仓库只提供接口，不包含浏览器 Demo、样本列表、图片压缩、人工确认弹窗或 WMS 回填页面。当前能力仍用于接口联调和试点验证，不代表已接入生产 WMS 或正式上线。
+
+## 与 Demo 仓库的区别
+
+Demo 仓库：`wms-batch-recognition-php-demo`
+
+纯接口仓库：`wms-batch-recognition-api-php`
+
+纯接口版移除：
+
+- 首页 Demo 页面
+- 拍照/选择图片按钮
+- 测试样本下拉框
+- 图片预览和人工确认弹窗
+- 前端图片压缩逻辑
+- 上传照片列表
+- `/api/samples`
+- `/sample/...`
+- `public/app.js`
+- `public/index.html`
+- `public/styles.css`
+
+纯接口版保留：
+
+- `GET /`
+- `GET /api/health`
+- `POST /api/wms/batch-recognize`
+- `POST /api/wms/batch-feedback`
+- DashScope `qwen3.6-flash`
+- thinking 关闭
+- AI 超过 3 秒按未识别处理
+- 三字段识别和人工确认边界
+- 180 天日志留存
+- WMS 调用方 Token 鉴权
+
+## 前端职责
+
+WMS 小程序或前端需要负责：
+
+- 手机拍照或从相册选图
+- 图片压缩
+- 调用 `/api/wms/batch-recognize`
+- 展示识别中、已识别、未识别、失败状态
+- 展示和允许人工修改 `厂商批号`、`生产日期`、`失效日期`
+- 用户点击确认后才回填 WMS 页面
+- 调用 `/api/wms/batch-feedback` 记录人工确认结果
+- 防止 AI 结果绕过人工确认直接入库
+
+建议前端压缩规则：
+
+```text
+maxSide = 1600
+jpegQuality = 0.82
+skipBelowBytes = 800KB
+```
+
+压缩逻辑：
+
+1. 读取原图大小和宽高。
+2. 如果最大边 `<=1600px` 且图片大小 `<=800KB`，可以不压缩。
+3. 如果最大边 `>1600px`，按比例缩到最大边 1600px。
+4. 如果图片 `>800KB`，转 JPEG，质量 `0.82`。
+5. 如果压缩后反而更大，且没有缩放需求，可以继续用原图。
+6. 如果做了缩放，使用压缩后的 JPEG。
+7. 透明背景转 JPEG 时用白底铺底。
+8. 前端把压缩参数放入 `image_meta`，由接口写入日志。
+
+## 产品边界
+
+- 当前验证字段：厂商批号、生产日期、失效日期。
+- 不识别型号、规格、货号、数量、价格。
+- 触发词同级：`LOT`、`Lot No`、`Lot Number`、`Batch`、`S/N`、`Serial No`、`Retrace Code`、`批号`、`生产批号`、`批次号`、`批次代码`、`序列号`、`产品序列号`、`序号`、`出厂编号`。
+- 字段名本身不能作为候选值；例如 `序列号 Serial no: 70552605046` 只返回 `70552605046`，不能把 `Serial`、`Serial no`、`No`、`序列号` 写入候选。
+- 本阶段不做条形码解码；条形码图形旁没有明文编号时，不从条形码图形推断批号。
+- 日期字段必须有明确字段、图标或日期语义才返回；只到年月时默认补为当月 1 号，例如 `2026年05月` 返回 `2026-05-01`。
+- 识别不到返回空值，不猜，不输出“疑似”“待复核”。
+- 结果必须人工确认。
+- 本服务不写入 WMS，不自动入库。
+- 服务端不压缩、不留存图片文件，只记录收到的图片大小、MIME、宽高、前端压缩参数、识别结果、耗时和人工反馈日志。
+
+## 运行要求
+
+目标服务器：CentOS 7.4 64 位。
+
+建议运行环境：
+
+- PHP 7.2 或更高，推荐 PHP 7.4。
+- PHP 扩展：`curl`、`json`。
+- Web Server：Nginx + PHP-FPM，或 Apache + PHP。
+
+CentOS 7.4 自带 PHP 版本通常偏旧，建议使用 Remi 源安装 PHP 7.4。
+
+## CentOS 7.4 部署方式
+
+### 1. 安装 PHP 7.4 与扩展
+
+```bash
+sudo yum install -y epel-release yum-utils
+sudo rpm -Uvh https://rpms.remirepo.net/enterprise/remi-release-7.rpm
+sudo yum-config-manager --enable remi-php74
+sudo yum install -y php php-cli php-fpm php-json php-curl php-mbstring
+
+php -v
+php -m | egrep 'curl|json'
+```
+
+### 2. 拉取代码
+
+```bash
+sudo mkdir -p /opt/wms-batch-recognition-api-php
+sudo chown -R $USER:$USER /opt/wms-batch-recognition-api-php
+
+git clone git@github.com:Lmq1111/wms-batch-recognition-api-php.git /opt/wms-batch-recognition-api-php
+cd /opt/wms-batch-recognition-api-php
+```
+
+### 3. 配置环境变量
+
+```bash
+cp .env.example .env
+vi .env
+```
+
+`.env` 示例：
+
+```bash
+DASHSCOPE_API_KEY=你的百炼APIKey
+WMS_API_TOKEN=给WMS或小程序后端的共享Token
+AI_MODEL=qwen3.6-flash
+AI_API_ENDPOINT=https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
+AI_MAX_TOKENS=900
+AI_TIMEOUT_MS=3000
+CORS_ALLOW_ORIGIN=*
+MAX_JSON_BYTES=18874368
+RECOGNITION_LOG_PATH=logs/recognition-events.jsonl
+LOG_RETENTION_DAYS=180
+```
+
+不要把真实 API Key 提交到 Git。生产或外部联调建议设置 `WMS_API_TOKEN`，由 WMS 后端或小程序服务端带 `Authorization` 或 `X-API-Key` 调用。
+
+### 4. 设置日志目录权限
+
+```bash
+mkdir -p logs
+sudo chown -R nginx:nginx logs
+sudo chmod -R 775 logs
+```
+
+如果 PHP-FPM 使用 `apache` 用户运行，把上面的 `nginx:nginx` 改成 `apache:apache`。
+
+### 5. Nginx + PHP-FPM 配置
+
+确认 PHP-FPM 已启动：
+
+```bash
+sudo systemctl enable php-fpm
+sudo systemctl start php-fpm
+sudo systemctl status php-fpm
+```
+
+新增 Nginx 配置，例如 `/etc/nginx/conf.d/wms-batch-recognition-api-php.conf`：
+
+```nginx
+server {
+    listen 80;
+    server_name your-domain.example.com;
+
+    root /opt/wms-batch-recognition-api-php/public;
+    index index.php;
+
+    client_max_body_size 20m;
+
+    location / {
+        try_files $uri /index.php$is_args$args;
+    }
+
+    location ~ \.php$ {
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_param SCRIPT_NAME $fastcgi_script_name;
+        fastcgi_pass 127.0.0.1:9000;
+    }
+}
+```
+
+检查并重载：
+
+```bash
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+微信小程序正式联调通常需要 HTTPS 域名，并在小程序后台配置 request 合法域名。建议由 IT 用 Nginx/网关统一加 HTTPS、鉴权和访问日志。
+
+### 6. 临时本地验证方式
+
+```bash
+cd /opt/wms-batch-recognition-api-php
+php -S 0.0.0.0:5179 -t public
+```
+
+生产部署不建议长期使用 PHP 内置服务。
+
+## 接口
+
+### 服务说明
+
+```text
+GET /
+```
+
+返回模板：
+
+```json
+{
+  "ok": true,
+  "service": "wms-batch-recognition-api-php",
+  "runtime": "php",
+  "endpoints": {
+    "health": "GET /api/health",
+    "recognize": "POST /api/wms/batch-recognize",
+    "feedback": "POST /api/wms/batch-feedback"
+  }
+}
+```
+
+### 健康检查
+
+```text
+GET /api/health
+```
+
+返回模板：
+
+```json
+{
+  "ok": true,
+  "hasApiKey": true,
+  "provider": "dashscope",
+  "providerLabel": "DashScope",
+  "model": "qwen3.6-flash",
+  "thinking": "disabled",
+  "aiTimeoutMs": 3000,
+  "logRetentionDays": 180,
+  "logEnabled": true,
+  "runtime": "php",
+  "phpVersion": "7.4.33"
+}
+```
+
+### 批次识别
+
+```text
+POST /api/wms/batch-recognize
+Content-Type: application/json
+Authorization: Bearer <WMS_API_TOKEN>
+```
+
+也可以使用：
+
+```text
+X-API-Key: <WMS_API_TOKEN>
+```
+
+请求模板，传图片 base64：
+
+```json
+{
+  "request_id": "optional-client-request-id",
+  "imageBase64": "base64-content-without-data-url-prefix",
+  "mimeType": "image/jpeg",
+  "source": "wms-miniapp",
+  "image_meta": {
+    "compressed": true,
+    "original_image_size_kb": 1800,
+    "recognition_image_size_kb": 320,
+    "width": 1200,
+    "height": 900,
+    "max_side": 1600,
+    "quality": 0.82
+  },
+  "client_meta": {
+    "device": "optional",
+    "operator_id": "optional"
+  }
+}
+```
+
+请求模板，传完整 data URL：
+
+```json
+{
+  "request_id": "optional-client-request-id",
+  "imageDataUrl": "data:image/jpeg;base64,...",
+  "source": "wms-miniapp",
+  "image_meta": {
+    "compressed": false,
+    "original_image_size_kb": 640,
+    "recognition_image_size_kb": 640,
+    "width": 1280,
+    "height": 960,
+    "max_side": 1600,
+    "quality": 0.82
+  }
+}
+```
+
+识别成功返回模板：
+
+```json
+{
+  "ok": true,
+  "request_id": "optional-client-request-id",
+  "data": {
+    "batch_number": "A-263100-3Z26",
+    "production_date": "2026-05-01",
+    "expiry_date": "",
+    "status": "recognized",
+    "confidence": "high",
+    "trigger": "Serial No",
+    "candidates": ["A-263100-3Z26"],
+    "needs_human_confirmation": true
+  },
+  "audit": {
+    "ai_raw_visible_text": "Serial No A-263100-3Z26",
+    "ai_reason": "图片中明确存在触发词 Serial No..."
+  },
+  "meta": {
+    "elapsed_ms": 1521,
+    "total_elapsed_ms": 1540,
+    "ai_timeout_ms": 3000,
+    "provider": "dashscope",
+    "provider_label": "DashScope",
+    "model": "qwen3.6-flash",
+    "thinking": "disabled",
+    "image_info": {
+      "received_image_size_kb": 320,
+      "received_image_bytes": 327680,
+      "received_mime_type": "image/jpeg",
+      "received_width": 1200,
+      "received_height": 900,
+      "client_compressed": true,
+      "client_original_image_size_kb": 1800,
+      "client_recognition_image_size_kb": 320,
+      "client_image_width": 1200,
+      "client_image_height": 900,
+      "client_image_max_side": 1600,
+      "client_image_quality": 0.82
+    }
+  }
+}
+```
+
+未识别返回模板：
+
+```json
+{
+  "ok": true,
+  "request_id": "optional-client-request-id",
+  "data": {
+    "batch_number": "",
+    "production_date": "",
+    "expiry_date": "",
+    "status": "not_found",
+    "confidence": "unknown",
+    "trigger": "",
+    "candidates": [],
+    "needs_human_confirmation": true
+  },
+  "audit": {
+    "ai_raw_visible_text": "",
+    "ai_reason": "未识别到明确批号。"
+  },
+  "meta": {
+    "elapsed_ms": 1300,
+    "total_elapsed_ms": 1318,
+    "ai_timeout_ms": 3000
+  }
+}
+```
+
+如果 AI 模型调用超过 `AI_TIMEOUT_MS`，接口会中止模型请求，并按 `status=not_found` 返回空批号，不作为接口错误处理。
+
+### 人工确认反馈
+
+```text
+POST /api/wms/batch-feedback
+Content-Type: application/json
+Authorization: Bearer <WMS_API_TOKEN>
+```
+
+请求模板：
+
+```json
+{
+  "request_id": "optional-client-request-id",
+  "ai_batch_number": "A-263100-3Z26",
+  "confirmed_batch_number": "A-263100-3Z26",
+  "ai_production_date": "2026-05-01",
+  "confirmed_production_date": "2026-05-01",
+  "ai_expiry_date": "",
+  "confirmed_expiry_date": "",
+  "is_modified": false,
+  "operator": "optional",
+  "note": "optional"
+}
+```
+
+返回模板：
+
+```json
+{
+  "ok": true,
+  "request_id": "optional-client-request-id"
+}
+```
+
+## 日志
+
+默认日志文件：
+
+```text
+logs/recognition-events.jsonl
+```
+
+首次写入会自动创建目录和文件。日志默认只保留 180 天，可通过 `LOG_RETENTION_DAYS` 调整。服务端不保存图片文件，只保存图片元信息、识别结果、耗时和人工反馈。
+
+## 本地 curl 示例
+
+健康检查：
+
+```bash
+curl http://127.0.0.1:5179/api/health
+```
+
+识别请求：
+
+```bash
+IMAGE_BASE64=$(base64 -w 0 sample.jpg)
+
+curl -X POST http://127.0.0.1:5179/api/wms/batch-recognize \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer your-wms-api-token' \
+  -d "{
+    \"request_id\": \"test-curl\",
+    \"imageBase64\": \"${IMAGE_BASE64}\",
+    \"mimeType\": \"image/jpeg\",
+    \"source\": \"curl-test\",
+    \"image_meta\": {
+      \"compressed\": true,
+      \"original_image_size_kb\": 1800,
+      \"recognition_image_size_kb\": 320,
+      \"width\": 1200,
+      \"height\": 900,
+      \"max_side\": 1600,
+      \"quality\": 0.82
+    }
+  }"
+```
+
+## 目录结构
+
+```text
+.
+├── public/
+│   ├── .htaccess
+│   └── index.php
+├── docs/
+│   └── log-fields.md
+├── .env.example
+├── .gitignore
+└── README.md
+```
